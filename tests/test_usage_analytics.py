@@ -3,6 +3,12 @@ import os
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 
 from src.api.endpoints import extract_usage_metrics
+from src.conversion.response_converter import (
+    convert_openai_streaming_to_claude,
+    convert_openai_to_claude_response,
+    parse_textual_tool_call,
+)
+from src.models.claude import ClaudeMessagesRequest
 
 
 def test_extract_usage_metrics_includes_cache_read_tokens():
@@ -27,3 +33,88 @@ def test_extract_usage_metrics_defaults_cache_read_tokens_to_zero():
         "output_tokens": 45,
         "cache_read_input_tokens": 0,
     }
+
+
+def test_parse_textual_tool_call():
+    parsed = parse_textual_tool_call(
+        '[Tool call id=fc_toolu_123 name=mcp__pencil__get_editor_state input={"include_schema": true}]'
+    )
+
+    assert parsed == {
+        "id": "fc_toolu_123",
+        "name": "mcp__pencil__get_editor_state",
+        "input": {"include_schema": True},
+    }
+
+
+def test_non_streaming_response_converts_textual_tool_call_to_tool_use():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Check editor state"}],
+    )
+    response = convert_openai_to_claude_response(
+        {
+            "id": "chatcmpl_1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": '[Tool call id=fc_toolu_123 name=mcp__pencil__get_editor_state input={"include_schema": true}]',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 12},
+        },
+        request,
+    )
+
+    assert response["stop_reason"] == "tool_use"
+    assert response["content"] == [
+        {
+            "type": "tool_use",
+            "id": "fc_toolu_123",
+            "name": "mcp__pencil__get_editor_state",
+            "input": {"include_schema": True},
+        }
+    ]
+
+
+async def test_streaming_response_converts_textual_tool_call_to_tool_use():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        stream=True,
+        messages=[{"role": "user", "content": "Check editor state"}],
+    )
+
+    async def fake_stream():
+        yield (
+            'data: {"choices":[{"delta":{"content":"[Tool call id=fc_toolu_123 "},'
+            '"finish_reason":null}]}'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"content":"name=mcp__pencil__get_editor_state '
+            'input={\\"include_schema\\": true}]"},"finish_reason":"stop"}]}'
+        )
+        yield "data: [DONE]"
+
+    class FakeLogger:
+        def warning(self, *_args, **_kwargs):
+            pass
+
+        def error(self, *_args, **_kwargs):
+            pass
+
+    events = [
+        event
+        async for event in convert_openai_streaming_to_claude(fake_stream(), request, FakeLogger())
+    ]
+    payload = "".join(events)
+
+    assert '"type": "tool_use"' in payload
+    assert '"name": "mcp__pencil__get_editor_state"' in payload
+    assert '\\"include_schema\\": true' in payload
+    assert '"stop_reason": "tool_use"' in payload
+    assert "Tool call id=fc_toolu_123" not in payload
