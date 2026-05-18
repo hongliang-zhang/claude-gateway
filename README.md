@@ -95,6 +95,17 @@ The application automatically loads environment variables from a `.env` file in 
 - `MAX_TOKENS_LIMIT` - Token limit (default: `4096`)
 - `REQUEST_TIMEOUT` - Request timeout in seconds (default: `90`)
 
+**Provider Compatibility:**
+
+- `PROVIDER_COMPAT` - Provider-specific compatibility mode. Set to `zai` for `router.z.ai` if text-model requests reject multimodal content arrays.
+
+**PostHog Analytics and Logs:**
+
+- `POSTHOG_API_KEY` - PostHog project token (`phc_...`) for event and log ingestion
+- `POSTHOG_HOST` - PostHog ingestion host (default: `https://us.i.posthog.com`)
+- `POSTHOG_LOGS_ENABLED` - Send structured OTLP logs to PostHog Logs when `true` (default: `false`)
+- `POSTHOG_SERVICE_NAME` - Service name attached to PostHog Logs (default: `claude-code-proxy`)
+
 **Custom Headers:**
 
 - `CUSTOM_HEADER_*` - Custom headers for API requests (e.g., `CUSTOM_HEADER_ACCEPT`, `CUSTOM_HEADER_AUTHORIZATION`)

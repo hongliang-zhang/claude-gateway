@@ -1,0 +1,8 @@
+name = "claude-gateway-hongliang"
+main = "src/worker.js"
+compatibility_date = "2025-12-01"
+
+workers_dev = true
+
+[vars]
+UPSTREAM_ORIGIN = "https://claude-code-proxy-production-6c26.up.railway.app"

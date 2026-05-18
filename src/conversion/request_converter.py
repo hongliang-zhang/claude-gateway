@@ -137,6 +137,12 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
     if isinstance(msg.content, str):
         return {"role": Constants.ROLE_USER, "content": msg.content}
 
+    if config.flatten_multimodal_content:
+        return {
+            "role": Constants.ROLE_USER,
+            "content": flatten_claude_content_blocks_to_text(msg.content),
+        }
+
     # Handle multimodal content
     openai_content = []
     for block in msg.content:
@@ -163,6 +169,23 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
         return {"role": Constants.ROLE_USER, "content": openai_content[0]["text"]}
     else:
         return {"role": Constants.ROLE_USER, "content": openai_content}
+
+
+def flatten_claude_content_blocks_to_text(content_blocks: List[Any]) -> str:
+    """Convert Claude content blocks to a text-only message for providers that reject arrays."""
+    text_parts = []
+    for block in content_blocks:
+        if block.type == Constants.CONTENT_TEXT and block.text:
+            text_parts.append(block.text)
+        elif block.type == Constants.CONTENT_IMAGE:
+            media_type = None
+            if isinstance(block.source, dict):
+                media_type = block.source.get("media_type")
+            text_parts.append(f"[Image omitted: {media_type or 'unknown media type'}]")
+        elif block.type == Constants.CONTENT_TOOL_RESULT:
+            text_parts.append(parse_tool_result_content(block.content))
+
+    return "\n\n".join(part for part in text_parts if part).strip()
 
 
 def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:

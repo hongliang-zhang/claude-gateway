@@ -10,6 +10,11 @@ class Config:
         
         # Add Anthropic API key for client validation
         self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        self.anthropic_api_keys = [
+            key.strip()
+            for key in os.environ.get("ANTHROPIC_API_KEYS", "").split(",")
+            if key.strip()
+        ]
         if not self.anthropic_api_key:
             print("Warning: ANTHROPIC_API_KEY not set. Client API key validation will be disabled.")
         
@@ -24,6 +29,23 @@ class Config:
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))
+
+        # PostHog traffic analytics
+        self.posthog_api_key = os.environ.get("POSTHOG_API_KEY")
+        self.posthog_host = os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com").rstrip("/")
+        self.posthog_logs_enabled = (
+            os.environ.get("POSTHOG_LOGS_ENABLED", "false").lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.posthog_service_name = os.environ.get("POSTHOG_SERVICE_NAME", "claude-code-proxy")
+        self.posthog_capture_bodies = (
+            os.environ.get("POSTHOG_CAPTURE_BODIES", "false").lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.provider_compat = os.environ.get("PROVIDER_COMPAT", "").strip().lower()
+        self.flatten_multimodal_content = (
+            self.provider_compat == "zai" or "z.ai" in self.openai_base_url.lower()
+        )
         
         # Model settings - BIG and SMALL models
         self.big_model = os.environ.get("BIG_MODEL", "gpt-4o")
@@ -41,12 +63,17 @@ class Config:
         
     def validate_client_api_key(self, client_api_key):
         """Validate client's Anthropic API key"""
-        # If no ANTHROPIC_API_KEY is set in environment, skip validation
-        if not self.anthropic_api_key:
+        # If no client API key allowlist is set in environment, skip validation
+        allowed_keys = []
+        if self.anthropic_api_key:
+            allowed_keys.append(self.anthropic_api_key)
+        allowed_keys.extend(self.anthropic_api_keys)
+
+        if not allowed_keys:
             return True
             
         # Check if the client's API key matches the expected value
-        return client_api_key == self.anthropic_api_key
+        return client_api_key in allowed_keys
     
     def get_custom_headers(self):
         """Get custom headers from environment variables"""

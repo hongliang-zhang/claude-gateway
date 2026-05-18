@@ -5,6 +5,45 @@ from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest
 
 
+def parse_function_arguments(arguments: str):
+    """Parse function arguments, tolerating providers that concatenate JSON objects."""
+    if not arguments:
+        return {}
+
+    try:
+        return json.loads(arguments)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    values = []
+    index = 0
+    length = len(arguments)
+
+    while index < length:
+        while index < length and arguments[index].isspace():
+            index += 1
+        if index >= length:
+            break
+
+        try:
+            value, next_index = decoder.raw_decode(arguments, index)
+        except json.JSONDecodeError:
+            return None
+
+        values.append(value)
+        index = next_index
+
+    if not values:
+        return None
+
+    for value in reversed(values):
+        if isinstance(value, dict) and value:
+            return value
+
+    return values[-1]
+
+
 def convert_openai_to_claude_response(
     openai_response: dict, original_request: ClaudeMessagesRequest
 ) -> dict:
@@ -31,9 +70,9 @@ def convert_openai_to_claude_response(
     for tool_call in tool_calls:
         if tool_call.get("type") == Constants.TOOL_FUNCTION:
             function_data = tool_call.get(Constants.TOOL_FUNCTION, {})
-            try:
-                arguments = json.loads(function_data.get("arguments", "{}"))
-            except json.JSONDecodeError:
+            raw_arguments = function_data.get("arguments", "{}")
+            arguments = parse_function_arguments(raw_arguments)
+            if arguments is None:
                 arguments = {"raw_arguments": function_data.get("arguments", "")}
 
             content_blocks.append(
@@ -166,15 +205,12 @@ async def convert_openai_streaming_to_claude(
                                 tool_call["args_buffer"] += function_data["arguments"]
                                 
                                 # Try to parse complete JSON and send delta when we have valid JSON
-                                try:
-                                    json.loads(tool_call["args_buffer"])
-                                    # If parsing succeeds and we haven't sent this JSON yet
-                                    if not tool_call["json_sent"]:
-                                        yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': tool_call['claude_index'], 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': tool_call['args_buffer']}}, ensure_ascii=False)}\n\n"
-                                        tool_call["json_sent"] = True
-                                except json.JSONDecodeError:
-                                    # JSON is incomplete, continue accumulating
-                                    pass
+                                parsed_arguments = parse_function_arguments(tool_call["args_buffer"])
+                                # If parsing succeeds and we haven't sent this JSON yet
+                                if parsed_arguments is not None and not tool_call["json_sent"]:
+                                    partial_json = json.dumps(parsed_arguments, ensure_ascii=False)
+                                    yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': tool_call['claude_index'], 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': partial_json}}, ensure_ascii=False)}\n\n"
+                                    tool_call["json_sent"] = True
 
                     # Handle finish reason
                     if finish_reason:
@@ -220,6 +256,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     http_request: Request,
     openai_client,
     request_id: str,
+    on_complete=None,
 ):
     """Convert OpenAI streaming response to Claude streaming format with cancellation support."""
 
@@ -238,6 +275,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
     usage_data = {"input_tokens": 0, "output_tokens": 0}
+    openai_model = None
 
     try:
         async for line in openai_stream:
@@ -256,6 +294,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                     try:
                         chunk = json.loads(chunk_data)
                         # logger.info(f"OpenAI chunk: {chunk}")
+                        if chunk.get("model"):
+                            openai_model = chunk.get("model")
                         usage = chunk.get("usage", None)
                         if usage:
                             cache_read_input_tokens = 0
@@ -380,6 +420,9 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     for tool_data in current_tool_calls.values():
         if tool_data.get("started") and tool_data.get("claude_index") is not None:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': tool_data['claude_index']}, ensure_ascii=False)}\n\n"
+
+    if on_complete:
+        on_complete(usage_data, final_stop_reason, openai_model)
 
     yield f"event: {Constants.EVENT_MESSAGE_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_DELTA, 'delta': {'stop_reason': final_stop_reason, 'stop_sequence': None}, 'usage': usage_data}, ensure_ascii=False)}\n\n"
     yield f"event: {Constants.EVENT_MESSAGE_STOP}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_STOP}, ensure_ascii=False)}\n\n"

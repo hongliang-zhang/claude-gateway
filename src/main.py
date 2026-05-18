@@ -3,9 +3,11 @@ from src.api.endpoints import router as api_router
 import uvicorn
 import sys
 from src.core.config import config
+from src.core.analytics import posthog_traffic_middleware
 
 app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
 
+app.middleware("http")(posthog_traffic_middleware)
 app.include_router(api_router)
 
 

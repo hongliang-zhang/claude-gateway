@@ -2,9 +2,15 @@ from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from src.core.config import config
+from src.core.analytics import (
+    capture_posthog_log,
+    capture_posthog_event,
+    extract_client_api_key,
+    hash_identifier,
+)
 from src.core.logging import logger
 from src.core.client import OpenAIClient
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
@@ -28,6 +34,68 @@ openai_client = OpenAIClient(
     custom_headers=custom_headers,
 )
 
+
+def capture_gateway_error_log(
+    http_request: Request,
+    request: ClaudeMessagesRequest,
+    request_id: str,
+    status_code: int,
+    message: str,
+) -> None:
+    client_key_hash = hash_identifier(extract_client_api_key(dict(http_request.headers)))
+    capture_posthog_log(
+        "ERROR",
+        message,
+        {
+            "request_id": request_id,
+            "http.method": http_request.method,
+            "http.route": http_request.url.path,
+            "http.status_code": status_code,
+            "client_key_hash": client_key_hash,
+            "model": request.model,
+            "stream": bool(request.stream),
+            "message_count": len(request.messages),
+            "tool_count": len(request.tools or []),
+        },
+    )
+
+
+def extract_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
+    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+    return {
+        "input_tokens": usage.get("prompt_tokens", 0) or 0,
+        "output_tokens": usage.get("completion_tokens", 0) or 0,
+        "cache_read_input_tokens": prompt_tokens_details.get("cached_tokens", 0) or 0,
+    }
+
+
+def capture_gateway_completion_event(
+    http_request: Request,
+    request: ClaudeMessagesRequest,
+    openai_model: Optional[str],
+    stop_reason: Optional[str],
+    usage_metrics: Dict[str, int],
+) -> None:
+    client_key_hash = hash_identifier(extract_client_api_key(dict(http_request.headers)))
+    capture_posthog_event(
+        "gateway completion",
+        client_key_hash or "anonymous",
+        {
+            "$process_person_profile": False,
+            "model": request.model,
+            "upstream_model": openai_model,
+            "stream": bool(request.stream),
+            "message_count": len(request.messages),
+            "tool_count": len(request.tools or []),
+            "stop_reason": stop_reason,
+            "input_tokens": usage_metrics.get("input_tokens", 0),
+            "output_tokens": usage_metrics.get("output_tokens", 0),
+            "cache_read_input_tokens": usage_metrics.get("cache_read_input_tokens", 0),
+            "client_key_hash": client_key_hash,
+        },
+    )
+
+
 async def validate_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
     """Validate the client's API key from either x-api-key header or Authorization header."""
     client_api_key = None
@@ -38,8 +106,8 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
     elif authorization and authorization.startswith("Bearer "):
         client_api_key = authorization.replace("Bearer ", "")
     
-    # Skip validation if ANTHROPIC_API_KEY is not set in the environment
-    if not config.anthropic_api_key:
+    # Skip validation if no client API key allowlist is set in the environment
+    if not config.anthropic_api_key and not config.anthropic_api_keys:
         return
         
     # Validate the client API key
@@ -81,6 +149,13 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                         http_request,
                         openai_client,
                         request_id,
+                        on_complete=lambda usage, stop_reason, openai_model: capture_gateway_completion_event(
+                            http_request,
+                            request,
+                            openai_model,
+                            stop_reason,
+                            usage,
+                        ),
                     ),
                     media_type="text/event-stream",
                     headers={
@@ -93,6 +168,13 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             except HTTPException as e:
                 # Convert to proper error response for streaming
                 logger.error(f"Streaming error: {e.detail}")
+                capture_gateway_error_log(
+                    http_request,
+                    request,
+                    request_id,
+                    e.status_code,
+                    str(e.detail),
+                )
                 import traceback
 
                 logger.error(traceback.format_exc())
@@ -110,8 +192,23 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             claude_response = convert_openai_to_claude_response(
                 openai_response, request
             )
+            capture_gateway_completion_event(
+                http_request,
+                request,
+                openai_response.get("model"),
+                claude_response.get("stop_reason"),
+                extract_usage_metrics(openai_response.get("usage", {})),
+            )
             return claude_response
-    except HTTPException:
+    except HTTPException as e:
+        request_id_for_log = locals().get("request_id", "unassigned")
+        capture_gateway_error_log(
+            http_request,
+            request,
+            request_id_for_log,
+            e.status_code,
+            str(e.detail),
+        )
         raise
     except Exception as e:
         import traceback
@@ -119,11 +216,19 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
         error_message = openai_client.classify_openai_error(str(e))
+        request_id_for_log = locals().get("request_id", "unassigned")
+        capture_gateway_error_log(
+            http_request,
+            request,
+            request_id_for_log,
+            500,
+            error_message,
+        )
         raise HTTPException(status_code=500, detail=error_message)
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
+async def count_tokens(request: ClaudeTokenCountRequest, http_request: Request, _: None = Depends(validate_api_key)):
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar
@@ -152,6 +257,18 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
 
         # Rough estimation: 4 characters per token
         estimated_tokens = max(1, total_chars // 4)
+        client_key_hash = hash_identifier(extract_client_api_key(dict(http_request.headers)))
+        capture_posthog_event(
+            "gateway token count",
+            client_key_hash or "anonymous",
+            {
+                "$process_person_profile": False,
+                "model": request.model,
+                "estimated_input_tokens": estimated_tokens,
+                "message_count": len(request.messages),
+                "client_key_hash": client_key_hash,
+            },
+        )
 
         return {"input_tokens": estimated_tokens}
 
