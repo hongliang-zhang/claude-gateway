@@ -67,6 +67,28 @@ def test_extract_textual_tool_call_strips_echoed_tool_result_prefix():
     }
 
 
+def test_extract_antml_tool_call():
+    extracted = extract_textual_tool_call(
+        "让我先检查一下正确的 text node 属性格式。\n"
+        "[antml:function_calls>\n"
+        '<invoke name="mcp__pencil__batch_get">\n'
+        '<parameter name="filePath">/Users/zhanghongliang/Documents/agent工程自迭代实验/design.pen</parameter>\n'
+        '<parameter name="nodeIds">["bi8Au"]</parameter>\n'
+        '<parameter name="readDepth">3</parameter>\n'
+        "</invoke>\n"
+        "</antml:function_calls>"
+    )
+
+    assert extracted["prefix"] == "让我先检查一下正确的 text node 属性格式。"
+    assert extracted["tool_call"]["id"].startswith("toolu_")
+    assert extracted["tool_call"]["name"] == "mcp__pencil__batch_get"
+    assert extracted["tool_call"]["input"] == {
+        "filePath": "/Users/zhanghongliang/Documents/agent工程自迭代实验/design.pen",
+        "nodeIds": ["bi8Au"],
+        "readDepth": 3,
+    }
+
+
 def test_strip_internal_tool_results_hides_schema_echo():
     assert (
         strip_internal_tool_results(
@@ -187,3 +209,46 @@ async def test_streaming_response_converts_textual_tool_call_to_tool_use():
     assert '\\"include_schema\\": true' in payload
     assert '"stop_reason": "tool_use"' in payload
     assert "Tool call id=fc_toolu_123" not in payload
+
+
+async def test_streaming_response_converts_antml_tool_call_to_tool_use():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        stream=True,
+        messages=[{"role": "user", "content": "Check text node"}],
+    )
+
+    async def fake_stream():
+        yield (
+            'data: {"choices":[{"delta":{"content":"让我先检查一下正确的 text node 属性格式。\\n'
+            '[antml:function_calls>\\n<invoke name=\\"mcp__pencil__batch_get\\">\\n"},'
+            '"finish_reason":null}]}'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"content":"<parameter name=\\"filePath\\">/tmp/design.pen</parameter>\\n'
+            '<parameter name=\\"nodeIds\\">[\\"bi8Au\\"]</parameter>\\n'
+            '<parameter name=\\"readDepth\\">3</parameter>\\n</invoke>\\n</antml:function_calls>"},'
+            '"finish_reason":"stop"}]}'
+        )
+        yield "data: [DONE]"
+
+    class FakeLogger:
+        def warning(self, *_args, **_kwargs):
+            pass
+
+        def error(self, *_args, **_kwargs):
+            pass
+
+    events = [
+        event
+        async for event in convert_openai_streaming_to_claude(fake_stream(), request, FakeLogger())
+    ]
+    payload = "".join(events)
+
+    assert '"type": "tool_use"' in payload
+    assert '"name": "mcp__pencil__batch_get"' in payload
+    assert '\\"nodeIds\\": [\\"bi8Au\\"]' in payload
+    assert '\\"readDepth\\": 3' in payload
+    assert '"stop_reason": "tool_use"' in payload
+    assert "antml:function_calls" not in payload

@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from html import unescape
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest
@@ -49,6 +50,18 @@ TRAILING_TEXTUAL_TOOL_CALL_RE = re.compile(
     r"(?P<prefix>.*?)\[Tool call id=(?P<id>\S+) name=(?P<name>\S+) input=(?P<input>.*)\]\s*$",
     re.DOTALL,
 )
+TRAILING_ANTML_TOOL_CALLS_RE = re.compile(
+    r"(?P<prefix>.*?)[<\[]antml:function_calls>(?P<body>.*?)(?:</antml:function_calls>)?\s*$",
+    re.DOTALL,
+)
+ANTML_INVOKE_RE = re.compile(
+    r'<invoke\s+name="(?P<name>[^"]+)">\s*(?P<body>.*?)\s*</invoke>',
+    re.DOTALL,
+)
+ANTML_PARAMETER_RE = re.compile(
+    r'<parameter\s+name="(?P<name>[^"]+)">(?P<value>.*?)</parameter>',
+    re.DOTALL,
+)
 INTERNAL_TOOL_RESULT_RE = re.compile(
     r"\s*\[Tool result for id=[^\]]+\]\s*.*",
     re.DOTALL,
@@ -67,23 +80,56 @@ def parse_textual_tool_call(text: str):
 def extract_textual_tool_call(text: str):
     """Extract a trailing textual tool call and hide echoed internal tool results."""
     match = TRAILING_TEXTUAL_TOOL_CALL_RE.match(text or "")
-    if not match:
+    if match:
+        raw_arguments = match.group("input").strip()
+        arguments = parse_function_arguments(raw_arguments)
+        if arguments is None:
+            arguments = {"raw_arguments": raw_arguments}
+
+        prefix = strip_internal_tool_results(match.group("prefix")).strip()
+        return {
+            "prefix": prefix,
+            "tool_call": {
+                "id": match.group("id"),
+                "name": match.group("name"),
+                "input": arguments,
+            },
+        }
+
+    antml_match = TRAILING_ANTML_TOOL_CALLS_RE.match(text or "")
+    if not antml_match:
         return None
 
-    raw_arguments = match.group("input").strip()
-    arguments = parse_function_arguments(raw_arguments)
-    if arguments is None:
-        arguments = {"raw_arguments": raw_arguments}
+    tool_calls = parse_antml_tool_calls(antml_match.group("body"))
+    if not tool_calls:
+        return None
 
-    prefix = strip_internal_tool_results(match.group("prefix")).strip()
+    prefix = strip_internal_tool_results(antml_match.group("prefix")).strip()
     return {
         "prefix": prefix,
-        "tool_call": {
-            "id": match.group("id"),
-            "name": match.group("name"),
-            "input": arguments,
-        },
+        "tool_call": tool_calls[0],
     }
+
+
+def parse_antml_tool_calls(body: str) -> list[dict]:
+    tool_calls = []
+    for invoke_match in ANTML_INVOKE_RE.finditer(body or ""):
+        arguments = {}
+        for parameter_match in ANTML_PARAMETER_RE.finditer(invoke_match.group("body")):
+            name = parameter_match.group("name")
+            raw_value = unescape(parameter_match.group("value")).strip()
+            parsed_value = parse_function_arguments(raw_value)
+            arguments[name] = raw_value if parsed_value is None else parsed_value
+
+        tool_calls.append(
+            {
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": invoke_match.group("name"),
+                "input": arguments,
+            }
+        )
+
+    return tool_calls
 
 
 def strip_internal_tool_results(text: str) -> str:
