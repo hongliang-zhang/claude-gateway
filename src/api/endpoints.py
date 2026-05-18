@@ -69,6 +69,35 @@ def extract_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def describe_openai_message_shapes(openai_request: Dict[str, Any]) -> list[Dict[str, Any]]:
+    shapes = []
+    for index, message in enumerate(openai_request.get("messages", [])):
+        content = message.get("content")
+        shape: Dict[str, Any] = {
+            "index": index,
+            "role": message.get("role"),
+            "content_type": type(content).__name__,
+            "has_tool_calls": bool(message.get("tool_calls")),
+        }
+        if isinstance(content, list):
+            shape["parts"] = [
+                {
+                    "index": part_index,
+                    "type": part.get("type") if isinstance(part, dict) else type(part).__name__,
+                    "text_type": (
+                        type(part.get("text")).__name__
+                        if isinstance(part, dict) and "text" in part
+                        else None
+                    ),
+                }
+                for part_index, part in enumerate(content)
+            ]
+        elif isinstance(content, str):
+            shape["content_length"] = len(content)
+        shapes.append(shape)
+    return shapes
+
+
 def capture_gateway_completion_event(
     http_request: Request,
     request: ClaudeMessagesRequest,
@@ -96,40 +125,48 @@ def capture_gateway_completion_event(
     )
 
 
-async def validate_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
+async def validate_api_key(
+    x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)
+):
     """Validate the client's API key from either x-api-key header or Authorization header."""
     client_api_key = None
-    
+
     # Extract API key from headers
     if x_api_key:
         client_api_key = x_api_key
     elif authorization and authorization.startswith("Bearer "):
         client_api_key = authorization.replace("Bearer ", "")
-    
+
     # Skip validation if no client API key allowlist is set in the environment
     if not config.anthropic_api_key and not config.anthropic_api_keys:
         return
-        
+
     # Validate the client API key
     if not client_api_key or not config.validate_client_api_key(client_api_key):
         logger.warning(f"Invalid API key provided by client")
         raise HTTPException(
-            status_code=401,
-            detail="Invalid API key. Please provide a valid Anthropic API key."
+            status_code=401, detail="Invalid API key. Please provide a valid Anthropic API key."
         )
 
+
 @router.post("/v1/messages")
-async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
+async def create_message(
+    request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)
+):
     try:
-        logger.debug(
-            f"Processing Claude request: model={request.model}, stream={request.stream}"
-        )
+        logger.debug(f"Processing Claude request: model={request.model}, stream={request.stream}")
 
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
 
         # Convert Claude request to OpenAI format
         openai_request = convert_claude_to_openai(request, model_manager)
+        logger.info(
+            "Converted OpenAI request shape: "
+            f"flatten={config.flatten_multimodal_content}, "
+            f"stream={request.stream}, "
+            f"messages={describe_openai_message_shapes(openai_request)}"
+        )
 
         # Check if client disconnected before processing
         if await http_request.is_disconnected():
@@ -186,12 +223,8 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
             # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(
-                openai_request, request_id
-            )
-            claude_response = convert_openai_to_claude_response(
-                openai_response, request
-            )
+            openai_response = await openai_client.create_chat_completion(openai_request, request_id)
+            claude_response = convert_openai_to_claude_response(openai_response, request)
             capture_gateway_completion_event(
                 http_request,
                 request,
@@ -228,7 +261,9 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, http_request: Request, _: None = Depends(validate_api_key)):
+async def count_tokens(
+    request: ClaudeTokenCountRequest, http_request: Request, _: None = Depends(validate_api_key)
+):
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar

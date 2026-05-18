@@ -132,3 +132,63 @@ def test_text_only_provider_normalizes_all_message_content_arrays():
     assert messages[2]["content"] == "tool result"
     assert messages[3]["content"] is None
     assert all(not isinstance(message.get("content"), list) for message in messages)
+
+
+def test_zai_compat_textualizes_tool_history():
+    original = config.flatten_multimodal_content
+    config.flatten_multimodal_content = True
+    try:
+        request = ClaudeMessagesRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=100,
+            tools=[
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            ],
+            messages=[
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "get_weather",
+                            "input": {"city": "Paris"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": [{"type": "text", "text": "Sunny"}],
+                        }
+                    ],
+                },
+            ],
+        )
+
+        converted = convert_claude_to_openai(request, model_manager)
+
+        assert [message["role"] for message in converted["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert "tool_calls" not in converted["messages"][1]
+        assert "get_weather" in converted["messages"][1]["content"]
+        assert "toolu_123" in converted["messages"][2]["content"]
+        assert "Sunny" in converted["messages"][2]["content"]
+        assert converted["tools"][0]["type"] == "function"
+    finally:
+        config.flatten_multimodal_content = original

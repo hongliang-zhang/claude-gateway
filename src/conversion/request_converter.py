@@ -46,7 +46,10 @@ def convert_claude_to_openai(
             openai_message = convert_claude_user_message(msg)
             openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_ASSISTANT:
-            openai_message = convert_claude_assistant_message(msg)
+            if config.flatten_multimodal_content:
+                openai_message = convert_claude_assistant_message_for_text_history(msg)
+            else:
+                openai_message = convert_claude_assistant_message(msg)
             openai_messages.append(openai_message)
 
             # Check if next message contains tool results
@@ -63,8 +66,13 @@ def convert_claude_to_openai(
                 ):
                     # Process tool results
                     i += 1  # Skip to tool result message
-                    tool_results = convert_claude_tool_results(next_msg)
-                    openai_messages.extend(tool_results)
+                    if config.flatten_multimodal_content:
+                        openai_messages.append(
+                            convert_claude_tool_results_to_user_message(next_msg)
+                        )
+                    else:
+                        tool_results = convert_claude_tool_results(next_msg)
+                        openai_messages.extend(tool_results)
 
         i += 1
 
@@ -284,6 +292,43 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
         openai_message["tool_calls"] = tool_calls
 
     return openai_message
+
+
+def convert_claude_assistant_message_for_text_history(msg: ClaudeMessage) -> Dict[str, Any]:
+    """Convert assistant history to text for providers that reject OpenAI tool history."""
+    if msg.content is None:
+        return {"role": Constants.ROLE_ASSISTANT, "content": ""}
+
+    if isinstance(msg.content, str):
+        return {"role": Constants.ROLE_ASSISTANT, "content": msg.content}
+
+    text_parts = []
+    for block in msg.content:
+        if block.type == Constants.CONTENT_TEXT and block.text:
+            text_parts.append(block.text)
+        elif block.type == Constants.CONTENT_TOOL_USE:
+            tool_input = stringify_content_part(block.input)
+            text_parts.append(f"[Tool call id={block.id} name={block.name} input={tool_input}]")
+
+    return {
+        "role": Constants.ROLE_ASSISTANT,
+        "content": "\n\n".join(part for part in text_parts if part).strip(),
+    }
+
+
+def convert_claude_tool_results_to_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
+    """Convert Claude tool results to a plain user message for text-only history."""
+    result_parts = []
+    if isinstance(msg.content, list):
+        for block in msg.content:
+            if block.type == Constants.CONTENT_TOOL_RESULT:
+                content = parse_tool_result_content(block.content)
+                result_parts.append(f"[Tool result for id={block.tool_use_id}]\n{content}")
+
+    return {
+        "role": Constants.ROLE_USER,
+        "content": "\n\n".join(part for part in result_parts if part).strip(),
+    }
 
 
 def convert_claude_tool_results(msg: ClaudeMessage) -> List[Dict[str, Any]]:
