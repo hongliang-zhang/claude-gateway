@@ -6,7 +6,9 @@ from src.api.endpoints import extract_usage_metrics
 from src.conversion.response_converter import (
     convert_openai_streaming_to_claude,
     convert_openai_to_claude_response,
+    extract_textual_tool_call,
     parse_textual_tool_call,
+    strip_internal_tool_results,
 )
 from src.models.claude import ClaudeMessagesRequest
 
@@ -47,6 +49,33 @@ def test_parse_textual_tool_call():
     }
 
 
+def test_extract_textual_tool_call_strips_echoed_tool_result_prefix():
+    extracted = extract_textual_tool_call(
+        "[Tool result for id=fc_toolu_abc]\n"
+        "Active file: /tmp/design.pen\n"
+        "<schema>internal schema docs</schema>\n\n"
+        "[Tool call id=fc_toolu_123 name=mcp__pencil__get_guidelines input={}]"
+    )
+
+    assert extracted == {
+        "prefix": "",
+        "tool_call": {
+            "id": "fc_toolu_123",
+            "name": "mcp__pencil__get_guidelines",
+            "input": {},
+        },
+    }
+
+
+def test_strip_internal_tool_results_hides_schema_echo():
+    assert (
+        strip_internal_tool_results(
+            "[Tool result for id=fc_toolu_abc]\n<schema>internal schema docs</schema>"
+        )
+        == ""
+    )
+
+
 def test_non_streaming_response_converts_textual_tool_call_to_tool_use():
     request = ClaudeMessagesRequest(
         model="claude-sonnet-4-6",
@@ -77,6 +106,46 @@ def test_non_streaming_response_converts_textual_tool_call_to_tool_use():
             "id": "fc_toolu_123",
             "name": "mcp__pencil__get_editor_state",
             "input": {"include_schema": True},
+        }
+    ]
+
+
+def test_non_streaming_response_hides_tool_result_prefix_before_textual_tool_call():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Create a diagram"}],
+    )
+    response = convert_openai_to_claude_response(
+        {
+            "id": "chatcmpl_1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "[Tool result for id=fc_toolu_abc]\n"
+                            "Active file: /tmp/design.pen\n"
+                            "<schema>internal schema docs</schema>\n\n"
+                            "[Tool call id=fc_toolu_123 "
+                            "name=mcp__pencil__get_guidelines input={}]"
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 12},
+        },
+        request,
+    )
+
+    assert response["stop_reason"] == "tool_use"
+    assert response["content"] == [
+        {
+            "type": "tool_use",
+            "id": "fc_toolu_123",
+            "name": "mcp__pencil__get_guidelines",
+            "input": {},
         }
     ]
 

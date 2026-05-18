@@ -45,15 +45,28 @@ def parse_function_arguments(arguments: str):
     return values[-1]
 
 
-TEXTUAL_TOOL_CALL_RE = re.compile(
-    r"^\s*\[Tool call id=(?P<id>\S+) name=(?P<name>\S+) input=(?P<input>.*)\]\s*$",
+TRAILING_TEXTUAL_TOOL_CALL_RE = re.compile(
+    r"(?P<prefix>.*?)\[Tool call id=(?P<id>\S+) name=(?P<name>\S+) input=(?P<input>.*)\]\s*$",
+    re.DOTALL,
+)
+INTERNAL_TOOL_RESULT_RE = re.compile(
+    r"\s*\[Tool result for id=[^\]]+\]\s*.*",
     re.DOTALL,
 )
 
 
 def parse_textual_tool_call(text: str):
     """Parse providers that emit tool calls as text instead of structured tool_calls."""
-    match = TEXTUAL_TOOL_CALL_RE.match(text or "")
+    extracted = extract_textual_tool_call(text)
+    if not extracted:
+        return None
+
+    return extracted["tool_call"]
+
+
+def extract_textual_tool_call(text: str):
+    """Extract a trailing textual tool call and hide echoed internal tool results."""
+    match = TRAILING_TEXTUAL_TOOL_CALL_RE.match(text or "")
     if not match:
         return None
 
@@ -62,10 +75,28 @@ def parse_textual_tool_call(text: str):
     if arguments is None:
         arguments = {"raw_arguments": raw_arguments}
 
+    prefix = strip_internal_tool_results(match.group("prefix")).strip()
     return {
-        "id": match.group("id"),
-        "name": match.group("name"),
-        "input": arguments,
+        "prefix": prefix,
+        "tool_call": {
+            "id": match.group("id"),
+            "name": match.group("name"),
+            "input": arguments,
+        },
+    }
+
+
+def strip_internal_tool_results(text: str) -> str:
+    """Remove tool-result transcripts that are internal context, not user-facing text."""
+    return INTERNAL_TOOL_RESULT_RE.sub("", text or "")
+
+
+def build_tool_use_block(tool_call: dict) -> dict:
+    return {
+        "type": Constants.CONTENT_TOOL_USE,
+        "id": tool_call["id"],
+        "name": tool_call["name"],
+        "input": tool_call["input"],
     }
 
 
@@ -88,18 +119,17 @@ def convert_openai_to_claude_response(
     # Add text content
     text_content = message.get("content")
     if text_content is not None:
-        textual_tool_call = parse_textual_tool_call(text_content)
-        if textual_tool_call:
-            content_blocks.append(
-                {
-                    "type": Constants.CONTENT_TOOL_USE,
-                    "id": textual_tool_call["id"],
-                    "name": textual_tool_call["name"],
-                    "input": textual_tool_call["input"],
-                }
-            )
+        extracted_tool_call = extract_textual_tool_call(text_content)
+        if extracted_tool_call:
+            if extracted_tool_call["prefix"]:
+                content_blocks.append(
+                    {"type": Constants.CONTENT_TEXT, "text": extracted_tool_call["prefix"]}
+                )
+            content_blocks.append(build_tool_use_block(extracted_tool_call["tool_call"]))
         else:
-            content_blocks.append({"type": Constants.CONTENT_TEXT, "text": text_content})
+            visible_text = strip_internal_tool_results(text_content).strip()
+            if visible_text:
+                content_blocks.append({"type": Constants.CONTENT_TEXT, "text": visible_text})
 
     # Add tool calls
     tool_calls = message.get("tool_calls", []) or []
@@ -280,20 +310,25 @@ async def convert_openai_streaming_to_claude(
 
     # Send final SSE events
     buffered_text = "".join(text_buffer)
-    textual_tool_call = parse_textual_tool_call(buffered_text)
-    if textual_tool_call:
+    extracted_tool_call = extract_textual_tool_call(buffered_text)
+    if extracted_tool_call:
+        if extracted_tool_call["prefix"]:
+            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': extracted_tool_call['prefix']}}, ensure_ascii=False)}\n\n"
         final_stop_reason = Constants.STOP_TOOL_USE
         tool_block_counter += 1
         claude_index = text_block_index + tool_block_counter
-        yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': textual_tool_call['id'], 'name': textual_tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
-        partial_json = json.dumps(textual_tool_call["input"], ensure_ascii=False)
+        tool_call = extracted_tool_call["tool_call"]
+        yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': tool_call['id'], 'name': tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
+        partial_json = json.dumps(tool_call["input"], ensure_ascii=False)
         yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': claude_index, 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': partial_json}}, ensure_ascii=False)}\n\n"
         current_tool_calls[claude_index] = {
             "started": True,
             "claude_index": claude_index,
         }
     elif buffered_text:
-        yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': buffered_text}}, ensure_ascii=False)}\n\n"
+        visible_text = strip_internal_tool_results(buffered_text).strip()
+        if visible_text:
+            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': text_block_index}, ensure_ascii=False)}\n\n"
 
@@ -484,20 +519,25 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
     # Send final SSE events
     buffered_text = "".join(text_buffer)
-    textual_tool_call = parse_textual_tool_call(buffered_text)
-    if textual_tool_call:
+    extracted_tool_call = extract_textual_tool_call(buffered_text)
+    if extracted_tool_call:
+        if extracted_tool_call["prefix"]:
+            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': extracted_tool_call['prefix']}}, ensure_ascii=False)}\n\n"
         final_stop_reason = Constants.STOP_TOOL_USE
         tool_block_counter += 1
         claude_index = text_block_index + tool_block_counter
-        yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': textual_tool_call['id'], 'name': textual_tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
-        partial_json = json.dumps(textual_tool_call["input"], ensure_ascii=False)
+        tool_call = extracted_tool_call["tool_call"]
+        yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': tool_call['id'], 'name': tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
+        partial_json = json.dumps(tool_call["input"], ensure_ascii=False)
         yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': claude_index, 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': partial_json}}, ensure_ascii=False)}\n\n"
         current_tool_calls[claude_index] = {
             "started": True,
             "claude_index": claude_index,
         }
     elif buffered_text:
-        yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': buffered_text}}, ensure_ascii=False)}\n\n"
+        visible_text = strip_internal_tool_results(buffered_text).strip()
+        if visible_text:
+            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': text_block_index}, ensure_ascii=False)}\n\n"
 
