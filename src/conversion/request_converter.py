@@ -30,17 +30,12 @@ def convert_claude_to_openai(
             for block in claude_request.system:
                 if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
                     text_parts.append(block.text)
-                elif (
-                    isinstance(block, dict)
-                    and block.get("type") == Constants.CONTENT_TEXT
-                ):
+                elif isinstance(block, dict) and block.get("type") == Constants.CONTENT_TEXT:
                     text_parts.append(block.get("text", ""))
             system_text = "\n\n".join(text_parts)
 
         if system_text.strip():
-            openai_messages.append(
-                {"role": Constants.ROLE_SYSTEM, "content": system_text.strip()}
-            )
+            openai_messages.append({"role": Constants.ROLE_SYSTEM, "content": system_text.strip()})
 
     # Process Claude messages
     i = 0
@@ -126,6 +121,9 @@ def convert_claude_to_openai(
         else:
             openai_request["tool_choice"] = "auto"
 
+    if config.flatten_multimodal_content:
+        normalize_messages_for_text_only_provider(openai_request["messages"])
+
     return openai_request
 
 
@@ -133,7 +131,7 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
     """Convert Claude user message to OpenAI format."""
     if msg.content is None:
         return {"role": Constants.ROLE_USER, "content": ""}
-    
+
     if isinstance(msg.content, str):
         return {"role": Constants.ROLE_USER, "content": msg.content}
 
@@ -188,6 +186,65 @@ def flatten_claude_content_blocks_to_text(content_blocks: List[Any]) -> str:
     return "\n\n".join(part for part in text_parts if part).strip()
 
 
+def normalize_messages_for_text_only_provider(messages: List[Dict[str, Any]]) -> None:
+    """Ensure provider-compatible chat messages never contain array content."""
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = flatten_openai_content_parts_to_text(content)
+        elif content is None:
+            if message.get("role") == Constants.ROLE_ASSISTANT and message.get("tool_calls"):
+                continue
+            message["content"] = ""
+        elif not isinstance(content, str):
+            message["content"] = stringify_content_part(content)
+
+
+def flatten_openai_content_parts_to_text(content_parts: List[Any]) -> str:
+    text_parts = []
+    for part in content_parts:
+        text = stringify_openai_content_part(part)
+        if text:
+            text_parts.append(text)
+    return "\n\n".join(text_parts).strip()
+
+
+def stringify_openai_content_part(part: Any) -> str:
+    if isinstance(part, str):
+        return part
+
+    if isinstance(part, dict):
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text", "")
+            if isinstance(text, dict):
+                nested_text = text.get("text")
+                return nested_text if isinstance(nested_text, str) else stringify_content_part(text)
+            return text if isinstance(text, str) else stringify_content_part(text)
+
+        if part_type == "image_url":
+            return "[Image omitted]"
+
+        if part_type == Constants.CONTENT_IMAGE:
+            media_type = None
+            source = part.get("source")
+            if isinstance(source, dict):
+                media_type = source.get("media_type")
+            return f"[Image omitted: {media_type or 'unknown media type'}]"
+
+        if part_type == Constants.CONTENT_TOOL_RESULT:
+            return parse_tool_result_content(part.get("content"))
+
+    return stringify_content_part(part)
+
+
+def stringify_content_part(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
     """Convert Claude assistant message to OpenAI format."""
     text_parts = []
@@ -195,7 +252,7 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
 
     if msg.content is None:
         return {"role": Constants.ROLE_ASSISTANT, "content": None}
-    
+
     if isinstance(msg.content, str):
         return {"role": Constants.ROLE_ASSISTANT, "content": msg.content}
 
