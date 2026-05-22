@@ -129,20 +129,18 @@ async def validate_api_key(
     x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)
 ):
     """Validate the client's API key from either x-api-key header or Authorization header."""
-    client_api_key = None
-
-    # Extract API key from headers
+    client_api_keys = []
     if x_api_key:
-        client_api_key = x_api_key
-    elif authorization and authorization.startswith("Bearer "):
-        client_api_key = authorization.replace("Bearer ", "")
+        client_api_keys.append(x_api_key)
+    if authorization and authorization.startswith("Bearer "):
+        client_api_keys.append(authorization.replace("Bearer ", "", 1))
 
     # Skip validation if no client API key allowlist is set in the environment
     if not config.anthropic_api_key and not config.anthropic_api_keys:
         return
 
-    # Validate the client API key
-    if not client_api_key or not config.validate_client_api_key(client_api_key):
+    # Some clients send both auth headers. Accept either one if it matches the allowlist.
+    if not any(config.validate_client_api_key(key) for key in client_api_keys):
         logger.warning(f"Invalid API key provided by client")
         raise HTTPException(
             status_code=401, detail="Invalid API key. Please provide a valid Anthropic API key."

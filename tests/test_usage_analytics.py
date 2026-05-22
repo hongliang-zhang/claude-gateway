@@ -1,8 +1,10 @@
+import asyncio
 import os
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 
-from src.api.endpoints import extract_usage_metrics
+from src.api.endpoints import extract_usage_metrics, validate_api_key
+from src.core.config import config
 from src.core.constants import Constants
 from src.conversion.response_converter import (
     convert_openai_streaming_to_claude,
@@ -37,6 +39,18 @@ def test_extract_usage_metrics_defaults_cache_read_tokens_to_zero():
         "output_tokens": 45,
         "cache_read_input_tokens": 0,
     }
+
+
+def test_validate_api_key_accepts_allowed_authorization_when_x_api_key_is_stale(monkeypatch):
+    monkeypatch.setattr(config, "anthropic_api_key", "allowed-gateway-key")
+    monkeypatch.setattr(config, "anthropic_api_keys", [])
+
+    asyncio.run(
+        validate_api_key(
+            x_api_key="stale-sdk-key",
+            authorization="Bearer allowed-gateway-key",
+        )
+    )
 
 
 def test_parse_textual_tool_call():
