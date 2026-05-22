@@ -66,6 +66,12 @@ INTERNAL_TOOL_RESULT_RE = re.compile(
     r"\s*\[Tool result for id=[^\]]+\]\s*.*",
     re.DOTALL,
 )
+STREAM_HOLD_MARKERS = (
+    "[Tool call id=",
+    "[antml:function_calls>",
+    "<antml:function_calls>",
+    "[Tool result for id=",
+)
 
 
 def parse_textual_tool_call(text: str):
@@ -135,6 +141,29 @@ def parse_antml_tool_calls(body: str) -> list[dict]:
 def strip_internal_tool_results(text: str) -> str:
     """Remove tool-result transcripts that are internal context, not user-facing text."""
     return INTERNAL_TOOL_RESULT_RE.sub("", text or "")
+
+
+def split_streamable_text(pending_text: str) -> tuple[str, str]:
+    """Return text safe to stream now, keeping possible tool markup buffered."""
+    marker_positions = [
+        position for marker in STREAM_HOLD_MARKERS if (position := pending_text.find(marker)) >= 0
+    ]
+    if marker_positions:
+        split_at = min(marker_positions)
+        return pending_text[:split_at], pending_text[split_at:]
+
+    keep_length = 0
+    for marker in STREAM_HOLD_MARKERS:
+        max_candidate = min(len(marker) - 1, len(pending_text))
+        for length in range(max_candidate, 0, -1):
+            if marker.startswith(pending_text[-length:]):
+                keep_length = max(keep_length, length)
+                break
+
+    if keep_length:
+        return pending_text[:-keep_length], pending_text[-keep_length:]
+
+    return pending_text, ""
 
 
 def build_tool_use_block(tool_call: dict) -> dict:
@@ -248,7 +277,7 @@ async def convert_openai_streaming_to_claude(
     tool_block_counter = 0
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
-    text_buffer = []
+    pending_text = ""
 
     try:
         async for line in openai_stream:
@@ -273,7 +302,11 @@ async def convert_openai_streaming_to_claude(
 
                     # Handle text delta
                     if delta and "content" in delta and delta["content"] is not None:
-                        text_buffer.append(delta["content"])
+                        pending_text += delta["content"]
+                        streamable_text, pending_text = split_streamable_text(pending_text)
+                        visible_text = strip_internal_tool_results(streamable_text)
+                        if visible_text:
+                            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 
                     # Handle tool call deltas with improved incremental processing
                     if "tool_calls" in delta:
@@ -355,8 +388,7 @@ async def convert_openai_streaming_to_claude(
         return
 
     # Send final SSE events
-    buffered_text = "".join(text_buffer)
-    extracted_tool_call = extract_textual_tool_call(buffered_text)
+    extracted_tool_call = extract_textual_tool_call(pending_text)
     if extracted_tool_call:
         if extracted_tool_call["prefix"]:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': extracted_tool_call['prefix']}}, ensure_ascii=False)}\n\n"
@@ -371,8 +403,8 @@ async def convert_openai_streaming_to_claude(
             "started": True,
             "claude_index": claude_index,
         }
-    elif buffered_text:
-        visible_text = strip_internal_tool_results(buffered_text).strip()
+    elif pending_text:
+        visible_text = strip_internal_tool_results(pending_text).strip()
         if visible_text:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 
@@ -414,7 +446,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     final_stop_reason = Constants.STOP_END_TURN
     usage_data = {"input_tokens": 0, "output_tokens": 0}
     openai_model = None
-    text_buffer = []
+    pending_text = ""
 
     try:
         async for line in openai_stream:
@@ -461,7 +493,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
                     # Handle text delta
                     if delta and "content" in delta and delta["content"] is not None:
-                        text_buffer.append(delta["content"])
+                        pending_text += delta["content"]
+                        streamable_text, pending_text = split_streamable_text(pending_text)
+                        visible_text = strip_internal_tool_results(streamable_text)
+                        if visible_text:
+                            yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 
                     # Handle tool call deltas with improved incremental processing
                     if "tool_calls" in delta and delta["tool_calls"]:
@@ -564,8 +600,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
         return
 
     # Send final SSE events
-    buffered_text = "".join(text_buffer)
-    extracted_tool_call = extract_textual_tool_call(buffered_text)
+    extracted_tool_call = extract_textual_tool_call(pending_text)
     if extracted_tool_call:
         if extracted_tool_call["prefix"]:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': extracted_tool_call['prefix']}}, ensure_ascii=False)}\n\n"
@@ -580,8 +615,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             "started": True,
             "claude_index": claude_index,
         }
-    elif buffered_text:
-        visible_text = strip_internal_tool_results(buffered_text).strip()
+    elif pending_text:
+        visible_text = strip_internal_tool_results(pending_text).strip()
         if visible_text:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': visible_text}}, ensure_ascii=False)}\n\n"
 

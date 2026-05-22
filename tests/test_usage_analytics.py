@@ -3,11 +3,13 @@ import os
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 
 from src.api.endpoints import extract_usage_metrics
+from src.core.constants import Constants
 from src.conversion.response_converter import (
     convert_openai_streaming_to_claude,
     convert_openai_to_claude_response,
     extract_textual_tool_call,
     parse_textual_tool_call,
+    split_streamable_text,
     strip_internal_tool_results,
 )
 from src.models.claude import ClaudeMessagesRequest
@@ -96,6 +98,27 @@ def test_strip_internal_tool_results_hides_schema_echo():
         )
         == ""
     )
+
+
+def test_split_streamable_text_streams_normal_text_immediately():
+    streamable, pending = split_streamable_text("普通回答内容")
+
+    assert streamable == "普通回答内容"
+    assert pending == ""
+
+
+def test_split_streamable_text_holds_tool_markup_suffix():
+    streamable, pending = split_streamable_text("先说一句话。[antml:function_calls>")
+
+    assert streamable == "先说一句话。"
+    assert pending == "[antml:function_calls>"
+
+
+def test_split_streamable_text_holds_partial_marker_suffix():
+    streamable, pending = split_streamable_text("先说一句话。[antml:fun")
+
+    assert streamable == "先说一句话。"
+    assert pending == "[antml:fun"
 
 
 def test_non_streaming_response_converts_textual_tool_call_to_tool_use():
@@ -209,6 +232,40 @@ async def test_streaming_response_converts_textual_tool_call_to_tool_use():
     assert '\\"include_schema\\": true' in payload
     assert '"stop_reason": "tool_use"' in payload
     assert "Tool call id=fc_toolu_123" not in payload
+
+
+async def test_streaming_response_streams_normal_text_before_done():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        stream=True,
+        messages=[{"role": "user", "content": "Say hello"}],
+    )
+
+    async def fake_stream():
+        yield 'data: {"choices":[{"delta":{"content":"你好，"}, "finish_reason":null}]}'
+        yield 'data: {"choices":[{"delta":{"content":"马上开始。"}, "finish_reason":null}]}'
+        yield 'data: {"choices":[{"delta":{}, "finish_reason":"stop"}]}'
+        yield "data: [DONE]"
+
+    class FakeLogger:
+        def warning(self, *_args, **_kwargs):
+            pass
+
+        def error(self, *_args, **_kwargs):
+            pass
+
+    events = [
+        event
+        async for event in convert_openai_streaming_to_claude(fake_stream(), request, FakeLogger())
+    ]
+
+    first_text_index = next(index for index, event in enumerate(events) if "你好，" in event)
+    stop_index = next(
+        index for index, event in enumerate(events) if Constants.EVENT_MESSAGE_STOP in event
+    )
+
+    assert first_text_index < stop_index
 
 
 async def test_streaming_response_converts_antml_tool_call_to_tool_use():
