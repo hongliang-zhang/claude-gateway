@@ -27,6 +27,7 @@ def test_extract_usage_metrics_includes_cache_read_tokens():
     assert extract_usage_metrics(usage) == {
         "input_tokens": 120,
         "output_tokens": 45,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 80,
     }
 
@@ -37,7 +38,24 @@ def test_extract_usage_metrics_defaults_cache_read_tokens_to_zero():
     assert extract_usage_metrics(usage) == {
         "input_tokens": 120,
         "output_tokens": 45,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
+    }
+
+
+def test_extract_usage_metrics_preserves_claude_style_cache_tokens():
+    usage = {
+        "prompt_tokens": 120,
+        "completion_tokens": 45,
+        "cache_creation_input_tokens": 60,
+        "cache_read_input_tokens": 80,
+    }
+
+    assert extract_usage_metrics(usage) == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "cache_creation_input_tokens": 60,
+        "cache_read_input_tokens": 80,
     }
 
 

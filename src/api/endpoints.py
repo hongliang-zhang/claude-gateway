@@ -65,7 +65,12 @@ def extract_usage_metrics(usage: Dict[str, Any]) -> Dict[str, int]:
     return {
         "input_tokens": usage.get("prompt_tokens", 0) or 0,
         "output_tokens": usage.get("completion_tokens", 0) or 0,
-        "cache_read_input_tokens": prompt_tokens_details.get("cached_tokens", 0) or 0,
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": (
+            usage.get("cache_read_input_tokens")
+            or prompt_tokens_details.get("cached_tokens", 0)
+            or 0
+        ),
     }
 
 
@@ -119,6 +124,7 @@ def capture_gateway_completion_event(
             "stop_reason": stop_reason,
             "input_tokens": usage_metrics.get("input_tokens", 0),
             "output_tokens": usage_metrics.get("output_tokens", 0),
+            "cache_creation_input_tokens": usage_metrics.get("cache_creation_input_tokens", 0),
             "cache_read_input_tokens": usage_metrics.get("cache_read_input_tokens", 0),
             "client_key_hash": client_key_hash,
         },
