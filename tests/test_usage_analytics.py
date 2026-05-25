@@ -169,6 +169,38 @@ def test_non_streaming_response_converts_textual_tool_call_to_tool_use():
     ]
 
 
+def test_non_streaming_response_maps_cached_tokens_to_cache_read_input_tokens():
+    request = ClaudeMessagesRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Say hello"}],
+    )
+    response = convert_openai_to_claude_response(
+        {
+            "id": "chatcmpl_1",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 800},
+            },
+        },
+        request,
+    )
+
+    assert response["usage"] == {
+        "input_tokens": 1200,
+        "output_tokens": 20,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 800,
+    }
+
+
 def test_non_streaming_response_hides_tool_result_prefix_before_textual_tool_call():
     request = ClaudeMessagesRequest(
         model="claude-sonnet-4-6",

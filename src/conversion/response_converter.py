@@ -7,6 +7,18 @@ from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest
 
 
+def convert_openai_usage_to_claude_usage(usage: dict = None) -> dict:
+    usage = usage or {}
+    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+
+    return {
+        "input_tokens": usage.get("prompt_tokens", 0) or 0,
+        "output_tokens": usage.get("completion_tokens", 0) or 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": prompt_tokens_details.get("cached_tokens", 0) or 0,
+    }
+
+
 def parse_function_arguments(arguments: str):
     """Parse function arguments, tolerating providers that concatenate JSON objects."""
     if not arguments:
@@ -249,10 +261,7 @@ def convert_openai_to_claude_response(
         "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": openai_response.get("usage", {}).get("completion_tokens", 0),
-        },
+        "usage": convert_openai_usage_to_claude_usage(openai_response.get("usage")),
     }
 
     return claude_response
@@ -414,7 +423,7 @@ async def convert_openai_streaming_to_claude(
         if tool_data.get("started") and tool_data.get("claude_index") is not None:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': tool_data['claude_index']}, ensure_ascii=False)}\n\n"
 
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    usage_data = convert_openai_usage_to_claude_usage(None)
     yield f"event: {Constants.EVENT_MESSAGE_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_DELTA, 'delta': {'stop_reason': final_stop_reason, 'stop_sequence': None}, 'usage': usage_data}, ensure_ascii=False)}\n\n"
     yield f"event: {Constants.EVENT_MESSAGE_STOP}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_STOP}, ensure_ascii=False)}\n\n"
 
@@ -433,7 +442,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     # Send initial SSE events
-    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': convert_openai_usage_to_claude_usage(None)}}, ensure_ascii=False)}\n\n"
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}}, ensure_ascii=False)}\n\n"
 
@@ -444,7 +453,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     tool_block_counter = 0
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    usage_data = convert_openai_usage_to_claude_usage(None)
     openai_model = None
     pending_text = ""
 
@@ -469,17 +478,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                             openai_model = chunk.get("model")
                         usage = chunk.get("usage", None)
                         if usage:
-                            cache_read_input_tokens = 0
-                            prompt_tokens_details = usage.get("prompt_tokens_details", {})
-                            if prompt_tokens_details:
-                                cache_read_input_tokens = (
-                                    prompt_tokens_details.get("cached_tokens", 0) or 0
-                                )
-                            usage_data = {
-                                "input_tokens": usage.get("prompt_tokens", 0),
-                                "output_tokens": usage.get("completion_tokens", 0),
-                                "cache_read_input_tokens": cache_read_input_tokens,
-                            }
+                            usage_data = convert_openai_usage_to_claude_usage(usage)
                         choices = chunk.get("choices", [])
                         if not choices:
                             continue
