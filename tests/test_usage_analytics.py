@@ -10,6 +10,7 @@ from src.api.endpoints import (
     extract_usage_metrics,
     validate_api_key,
 )
+from src.core.client import OpenAIClient
 from src.core.config import config
 from src.core.constants import Constants
 from src.conversion.response_converter import (
@@ -197,6 +198,18 @@ def test_validate_api_key_pass_through_ignores_shared_allowlist(monkeypatch):
         )
         == "user-zai-key"
     )
+
+
+def test_openai_client_detects_zai_error_wrapped_in_http_200():
+    try:
+        OpenAIClient.raise_provider_error_if_present(
+            {"success": False, "code": 401, "msg": "token expired or incorrect"}
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert exc.detail == "token expired or incorrect"
+    else:
+        raise AssertionError("Expected HTTPException")
 
 
 def test_parse_textual_tool_call():
