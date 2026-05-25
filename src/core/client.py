@@ -86,6 +86,8 @@ class OpenAIClient:
             self.raise_provider_error_if_present(response_data)
             return response_data
 
+        except HTTPException:
+            raise
         except AuthenticationError as e:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
@@ -137,6 +139,8 @@ class OpenAIClient:
             # Signal end of stream
             yield "data: [DONE]"
 
+        except HTTPException:
+            raise
         except AuthenticationError as e:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
