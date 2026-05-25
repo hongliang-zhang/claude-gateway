@@ -18,14 +18,13 @@ def main():
         print("Usage: python src/main.py")
         print("")
         print("Required environment variables:")
-        print("  OPENAI_API_KEY - Your OpenAI API key")
+        print("  OPENAI_API_KEY - Upstream API key (required in shared auth mode)")
         print("")
         print("Optional environment variables:")
+        print("  GATEWAY_AUTH_MODE - shared or pass_through (default: shared)")
         print("  ANTHROPIC_API_KEY - Expected Anthropic API key for client validation")
         print("                      If set, clients must provide this exact API key")
-        print(
-            f"  OPENAI_BASE_URL - OpenAI API base URL (default: https://api.openai.com/v1)"
-        )
+        print(f"  OPENAI_BASE_URL - OpenAI API base URL (default: https://api.openai.com/v1)")
         print(f"  BIG_MODEL - Model for opus requests (default: gpt-4o)")
         print(f"  MIDDLE_MODEL - Model for sonnet requests (default: gpt-4o)")
         print(f"  SMALL_MODEL - Model for haiku requests (default: gpt-4o-mini)")
@@ -44,6 +43,7 @@ def main():
     # Configuration summary
     print("🚀 Claude-to-OpenAI API Proxy v1.0.0")
     print(f"✅ Configuration loaded successfully")
+    print(f"   Auth Mode: {config.gateway_auth_mode}")
     print(f"   OpenAI Base URL: {config.openai_base_url}")
     print(f"   Big Model (opus): {config.big_model}")
     print(f"   Middle Model (sonnet): {config.middle_model}")
@@ -51,16 +51,19 @@ def main():
     print(f"   Max Tokens Limit: {config.max_tokens_limit}")
     print(f"   Request Timeout: {config.request_timeout}s")
     print(f"   Server: {config.host}:{config.port}")
-    print(f"   Client API Key Validation: {'Enabled' if config.anthropic_api_key else 'Disabled'}")
+    print(
+        "   Client API Key Validation: "
+        f"{'Pass-through' if config.gateway_auth_mode == 'pass_through' else ('Enabled' if config.anthropic_api_key else 'Disabled')}"
+    )
     print("")
 
     # Parse log level - extract just the first word to handle comments
     log_level = config.log_level.split()[0].lower()
-    
+
     # Validate and set default if invalid
-    valid_levels = ['debug', 'info', 'warning', 'error', 'critical']
+    valid_levels = ["debug", "info", "warning", "error", "critical"]
     if log_level not in valid_levels:
-        log_level = 'info'
+        log_level = "info"
 
     # Start server
     uvicorn.run(

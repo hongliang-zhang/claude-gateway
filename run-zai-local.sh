@@ -7,6 +7,7 @@ if [[ -z "${ZAI_API_KEY:-}" ]]; then
 fi
 
 export OPENAI_API_KEY="${ZAI_API_KEY}"
+export GATEWAY_AUTH_MODE="${GATEWAY_AUTH_MODE:-shared}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://router.z.ai/api/v1}"
 export BIG_MODEL="${BIG_MODEL:-claude-sonnet-4-6}"
 export MIDDLE_MODEL="${MIDDLE_MODEL:-claude-sonnet-4-6}"

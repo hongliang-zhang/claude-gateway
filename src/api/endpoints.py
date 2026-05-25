@@ -26,13 +26,28 @@ router = APIRouter()
 # Get custom headers from config
 custom_headers = config.get_custom_headers()
 
-openai_client = OpenAIClient(
-    config.openai_api_key,
-    config.openai_base_url,
-    config.request_timeout,
-    api_version=config.azure_api_version,
-    custom_headers=custom_headers,
-)
+
+def build_openai_client(api_key: str) -> OpenAIClient:
+    return OpenAIClient(
+        api_key,
+        config.openai_base_url,
+        config.request_timeout,
+        api_version=config.azure_api_version,
+        custom_headers=custom_headers,
+    )
+
+
+def classify_openai_error(error_detail: Any) -> str:
+    api_key = config.openai_api_key or "unused"
+    return build_openai_client(api_key).classify_openai_error(error_detail)
+
+
+def extract_authorization_api_key(
+    x_api_key: Optional[str], authorization: Optional[str]
+) -> Optional[str]:
+    if authorization and authorization.startswith("Bearer "):
+        return authorization.replace("Bearer ", "", 1)
+    return x_api_key
 
 
 def capture_gateway_error_log(
@@ -133,8 +148,17 @@ def capture_gateway_completion_event(
 
 async def validate_api_key(
     x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)
-):
+) -> str:
     """Validate the client's API key from either x-api-key header or Authorization header."""
+    if config.gateway_auth_mode == "pass_through":
+        user_api_key = extract_authorization_api_key(x_api_key, authorization)
+        if not user_api_key:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing API key. Provide your Z.AI API key as the Anthropic API key.",
+            )
+        return user_api_key
+
     client_api_keys = []
     if x_api_key:
         client_api_keys.append(x_api_key)
@@ -143,7 +167,7 @@ async def validate_api_key(
 
     # Skip validation if no client API key allowlist is set in the environment
     if not config.anthropic_api_key and not config.anthropic_api_keys:
-        return
+        return config.openai_api_key
 
     # Some clients send both auth headers. Accept either one if it matches the allowlist.
     if not any(config.validate_client_api_key(key) for key in client_api_keys):
@@ -151,17 +175,21 @@ async def validate_api_key(
         raise HTTPException(
             status_code=401, detail="Invalid API key. Please provide a valid Anthropic API key."
         )
+    return config.openai_api_key
 
 
 @router.post("/v1/messages")
 async def create_message(
-    request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)
+    request: ClaudeMessagesRequest,
+    http_request: Request,
+    upstream_api_key: str = Depends(validate_api_key),
 ):
     try:
         logger.debug(f"Processing Claude request: model={request.model}, stream={request.stream}")
 
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
+        request_openai_client = build_openai_client(upstream_api_key)
 
         # Convert Claude request to OpenAI format
         openai_request = convert_claude_to_openai(request, model_manager)
@@ -179,7 +207,7 @@ async def create_message(
         if request.stream:
             # Streaming response - wrap in error handling
             try:
-                openai_stream = openai_client.create_chat_completion_stream(
+                openai_stream = request_openai_client.create_chat_completion_stream(
                     openai_request, request_id
                 )
                 return StreamingResponse(
@@ -188,7 +216,7 @@ async def create_message(
                         request,
                         logger,
                         http_request,
-                        openai_client,
+                        request_openai_client,
                         request_id,
                         on_complete=lambda usage, stop_reason, openai_model: capture_gateway_completion_event(
                             http_request,
@@ -219,7 +247,7 @@ async def create_message(
                 import traceback
 
                 logger.error(traceback.format_exc())
-                error_message = openai_client.classify_openai_error(e.detail)
+                error_message = request_openai_client.classify_openai_error(e.detail)
                 error_response = {
                     "type": "error",
                     "error": {"type": "api_error", "message": error_message},
@@ -227,7 +255,9 @@ async def create_message(
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
             # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(openai_request, request_id)
+            openai_response = await request_openai_client.create_chat_completion(
+                openai_request, request_id
+            )
             claude_response = convert_openai_to_claude_response(openai_response, request)
             capture_gateway_completion_event(
                 http_request,
@@ -252,7 +282,7 @@ async def create_message(
 
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
-        error_message = openai_client.classify_openai_error(str(e))
+        error_message = classify_openai_error(str(e))
         request_id_for_log = locals().get("request_id", "unassigned")
         capture_gateway_error_log(
             http_request,
@@ -266,7 +296,7 @@ async def create_message(
 
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(
-    request: ClaudeTokenCountRequest, http_request: Request, _: None = Depends(validate_api_key)
+    request: ClaudeTokenCountRequest, http_request: Request, _: str = Depends(validate_api_key)
 ):
     try:
         # For token counting, we'll use a simple estimation
@@ -322,18 +352,22 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "openai_api_configured": bool(config.openai_api_key),
-        "api_key_valid": config.validate_api_key(),
-        "client_api_key_validation": bool(config.anthropic_api_key),
+        "auth_mode": config.gateway_auth_mode,
+        "server_api_key_configured": bool(config.openai_api_key),
+        "server_api_key_valid": config.validate_api_key() if config.openai_api_key else None,
+        "client_api_key_validation": (
+            config.gateway_auth_mode == "pass_through" or bool(config.anthropic_api_key)
+        ),
     }
 
 
 @router.get("/test-connection")
-async def test_connection():
+async def test_connection(upstream_api_key: str = Depends(validate_api_key)):
     """Test API connectivity to OpenAI"""
     try:
+        request_openai_client = build_openai_client(upstream_api_key)
         # Simple test request to verify API connectivity
-        test_response = await openai_client.create_chat_completion(
+        test_response = await request_openai_client.create_chat_completion(
             {
                 "model": config.small_model,
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -359,8 +393,8 @@ async def test_connection():
                 "message": str(e),
                 "timestamp": datetime.now().isoformat(),
                 "suggestions": [
-                    "Check your OPENAI_API_KEY is valid",
-                    "Verify your API key has the necessary permissions",
+                    "Check the provided API key is valid",
+                    "Verify the API key has the necessary permissions",
                     "Check if you have reached rate limits",
                 ],
             },
@@ -375,9 +409,12 @@ async def root():
         "status": "running",
         "config": {
             "openai_base_url": config.openai_base_url,
+            "auth_mode": config.gateway_auth_mode,
             "max_tokens_limit": config.max_tokens_limit,
-            "api_key_configured": bool(config.openai_api_key),
-            "client_api_key_validation": bool(config.anthropic_api_key),
+            "server_api_key_configured": bool(config.openai_api_key),
+            "client_api_key_validation": (
+                config.gateway_auth_mode == "pass_through" or bool(config.anthropic_api_key)
+            ),
             "big_model": config.big_model,
             "small_model": config.small_model,
         },

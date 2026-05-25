@@ -3,7 +3,13 @@ import os
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test")
 
-from src.api.endpoints import extract_usage_metrics, validate_api_key
+from fastapi import HTTPException
+
+from src.api.endpoints import (
+    extract_authorization_api_key,
+    extract_usage_metrics,
+    validate_api_key,
+)
 from src.core.config import config
 from src.core.constants import Constants
 from src.conversion.response_converter import (
@@ -60,14 +66,136 @@ def test_extract_usage_metrics_preserves_claude_style_cache_tokens():
 
 
 def test_validate_api_key_accepts_allowed_authorization_when_x_api_key_is_stale(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "shared")
+    monkeypatch.setattr(config, "anthropic_api_key", "allowed-gateway-key")
+    monkeypatch.setattr(config, "anthropic_api_keys", [])
+    monkeypatch.setattr(config, "openai_api_key", "server-zai-key")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key="stale-sdk-key",
+                authorization="Bearer allowed-gateway-key",
+            )
+        )
+        == "server-zai-key"
+    )
+
+
+def test_validate_api_key_pass_through_uses_authorization_key(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "pass_through")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key="stale-sdk-key",
+                authorization="Bearer user-zai-key",
+            )
+        )
+        == "user-zai-key"
+    )
+
+
+def test_validate_api_key_pass_through_requires_user_key(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "pass_through")
+
+    try:
+        asyncio.run(validate_api_key(x_api_key=None, authorization=None))
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert "Missing API key" in exc.detail
+    else:
+        raise AssertionError("Expected HTTPException")
+
+
+def test_extract_authorization_api_key_prefers_authorization_over_x_api_key():
+    assert (
+        extract_authorization_api_key(
+            x_api_key="stale-sdk-key",
+            authorization="Bearer user-zai-key",
+        )
+        == "user-zai-key"
+    )
+
+
+def test_validate_api_key_shared_without_allowlist_uses_server_key(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "shared")
+    monkeypatch.setattr(config, "anthropic_api_key", None)
+    monkeypatch.setattr(config, "anthropic_api_keys", [])
+    monkeypatch.setattr(config, "openai_api_key", "server-zai-key")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key="any-client-key",
+                authorization=None,
+            )
+        )
+        == "server-zai-key"
+    )
+
+
+def test_validate_api_key_shared_rejects_unknown_key(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "shared")
     monkeypatch.setattr(config, "anthropic_api_key", "allowed-gateway-key")
     monkeypatch.setattr(config, "anthropic_api_keys", [])
 
-    asyncio.run(
-        validate_api_key(
-            x_api_key="stale-sdk-key",
-            authorization="Bearer allowed-gateway-key",
+    try:
+        asyncio.run(
+            validate_api_key(
+                x_api_key="wrong-key",
+                authorization=None,
+            )
         )
+    except HTTPException as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("Expected HTTPException")
+
+
+def test_validate_api_key_shared_accepts_additional_allowed_keys(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "shared")
+    monkeypatch.setattr(config, "anthropic_api_key", None)
+    monkeypatch.setattr(config, "anthropic_api_keys", ["team-key"])
+    monkeypatch.setattr(config, "openai_api_key", "server-zai-key")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key="team-key",
+                authorization=None,
+            )
+        )
+        == "server-zai-key"
+    )
+
+
+def test_validate_api_key_pass_through_accepts_x_api_key(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "pass_through")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key="user-zai-key",
+                authorization=None,
+            )
+        )
+        == "user-zai-key"
+    )
+
+
+def test_validate_api_key_pass_through_ignores_shared_allowlist(monkeypatch):
+    monkeypatch.setattr(config, "gateway_auth_mode", "pass_through")
+    monkeypatch.setattr(config, "anthropic_api_key", "old-gateway-key")
+
+    assert (
+        asyncio.run(
+            validate_api_key(
+                x_api_key=None,
+                authorization="Bearer user-zai-key",
+            )
+        )
+        == "user-zai-key"
     )
 
 
